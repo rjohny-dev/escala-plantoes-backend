@@ -70,14 +70,17 @@ router.post('/', async (req: Request, res: Response) => {
     systemInstruction: SYSTEM_CONTEXT,
   });
 
-  const MAX_RETRIES = 3;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const MAX_RETRIES = 10;
+  // delays: 3s, 5s, 7s, 9s, 11s, 13s, 15s, 15s, 15s (cap 15s)
+  const retryDelay = (attempt: number) => Math.min(3000 + (attempt - 1) * 2000, 15000);
+
   let lastErr: any;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       const result = await model.generateContent(question.trim());
       const answer = result.response.text();
-
       recordRequest(userId);
       res.json({ answer, questionsRemaining: DAILY_LIMIT - (todayCount + 1) });
       return;
@@ -85,7 +88,7 @@ router.post('/', async (req: Request, res: Response) => {
       lastErr = err;
       const is503 = err?.message?.includes('503') || err?.message?.includes('Service Unavailable');
       if (is503 && attempt < MAX_RETRIES) {
-        await new Promise((r) => setTimeout(r, attempt * 2000));
+        await sleep(retryDelay(attempt));
         continue;
       }
       break;
@@ -93,7 +96,7 @@ router.post('/', async (req: Request, res: Response) => {
   }
 
   console.error('Gemini error:', lastErr?.message ?? lastErr);
-  res.status(500).json({ error: 'Erro ao consultar a IA. Tente novamente.' });
+  res.status(500).json({ error: 'Serviço temporariamente indisponível. Tente novamente em instantes.' });
 });
 
 export default router;
