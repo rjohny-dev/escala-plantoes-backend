@@ -64,26 +64,36 @@ router.post('/', async (req: Request, res: Response) => {
     return;
   }
 
-  try {
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash-8b',
-      systemInstruction: SYSTEM_CONTEXT,
-    });
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    systemInstruction: SYSTEM_CONTEXT,
+  });
 
-    const result = await model.generateContent(question.trim());
-    const answer = result.response.text();
+  const MAX_RETRIES = 3;
+  let lastErr: any;
 
-    recordRequest(userId);
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const result = await model.generateContent(question.trim());
+      const answer = result.response.text();
 
-    res.json({
-      answer,
-      questionsRemaining: DAILY_LIMIT - (todayCount + 1),
-    });
-  } catch (err: any) {
-    console.error('Gemini error:', err?.message ?? err);
-    res.status(500).json({ error: 'Erro ao consultar a IA. Tente novamente.' });
+      recordRequest(userId);
+      res.json({ answer, questionsRemaining: DAILY_LIMIT - (todayCount + 1) });
+      return;
+    } catch (err: any) {
+      lastErr = err;
+      const is503 = err?.message?.includes('503') || err?.message?.includes('Service Unavailable');
+      if (is503 && attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, attempt * 2000));
+        continue;
+      }
+      break;
+    }
   }
+
+  console.error('Gemini error:', lastErr?.message ?? lastErr);
+  res.status(500).json({ error: 'Erro ao consultar a IA. Tente novamente.' });
 });
 
 export default router;
