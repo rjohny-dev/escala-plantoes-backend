@@ -28,7 +28,11 @@ Regras importantes:
 Responda de forma clara e objetiva em português. Se a pergunta não for sobre escala de trabalho, redirecione gentilmente.`;
 
 router.post('/', async (req: Request, res: Response) => {
-  const { question, userId } = req.body as { question?: string; userId?: string };
+  const { question, userId, scheduleContext } = req.body as {
+    question?: string;
+    userId?: string;
+    scheduleContext?: string;
+  };
 
   if (!question?.trim() || !userId?.trim()) {
     res.status(400).json({ error: 'question e userId são obrigatórios.' });
@@ -64,10 +68,14 @@ router.post('/', async (req: Request, res: Response) => {
     return;
   }
 
+  const systemInstruction = scheduleContext
+    ? `${SYSTEM_CONTEXT}\n\n--- ESCALA DO USUÁRIO (use estes dados para responder perguntas sobre datas específicas) ---\n${scheduleContext}\n--- FIM DA ESCALA ---`
+    : SYSTEM_CONTEXT;
+
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
     model: 'gemini-2.5-flash',
-    systemInstruction: SYSTEM_CONTEXT,
+    systemInstruction,
   });
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
