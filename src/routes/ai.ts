@@ -7,6 +7,10 @@ const router = Router();
 const DAILY_LIMIT = 10;
 const COOLDOWN_SECONDS = 30;
 
+// Modelos em ordem de preferência. Quando um esgota quota diária, cai no próximo.
+// gemini-2.5-flash: 20 RPD | gemini-2.0-flash: 200 RPD | gemini-1.5-flash: 1500 RPD
+const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+
 const SYSTEM_CONTEXT = `Você é um assistente especializado em escala de plantões 3x3 rotativa para trabalhadores do Brasil.
 
 O ciclo de 12 dias funciona assim:
@@ -25,7 +29,26 @@ Regras importantes:
 - Permuta: troca simples entre dois trabalhadores (sem débito)
 - Substituição: um faz o plantão pelo outro, cria débito pendente
 
+Quando receber a escala do usuário, use-a para responder perguntas sobre datas específicas diretamente, sem pedir informações adicionais.
 Responda de forma clara e objetiva em português. Se a pergunta não for sobre escala de trabalho, redirecione gentilmente.`;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function isDailyQuotaExceeded(err: any): boolean {
+  const msg: string = err?.message ?? '';
+  return msg.includes('429') && (
+    msg.includes('PerDay') ||
+    msg.includes('per_day') ||
+    msg.includes('GenerateRequestsPerDay')
+  );
+}
+
+function isTransient(err: any): boolean {
+  const msg: string = err?.message ?? '';
+  return msg.includes('503') ||
+    msg.includes('Service Unavailable') ||
+    (msg.includes('429') && msg.includes('PerMinute'));
+}
 
 router.post('/', async (req: Request, res: Response) => {
   const { question, userId, scheduleContext } = req.body as {
@@ -69,42 +92,45 @@ router.post('/', async (req: Request, res: Response) => {
   }
 
   const systemInstruction = scheduleContext
-    ? `${SYSTEM_CONTEXT}\n\n--- ESCALA DO USUÁRIO (use estes dados para responder perguntas sobre datas específicas) ---\n${scheduleContext}\n--- FIM DA ESCALA ---`
+    ? `${SYSTEM_CONTEXT}\n\n--- ESCALA DO USUÁRIO ---\n${scheduleContext}\n--- FIM DA ESCALA ---`
     : SYSTEM_CONTEXT;
 
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-2.5-flash',
-    systemInstruction,
-  });
-
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  const MAX_RETRIES = 10;
-  // delays: 3s, 5s, 7s, 9s, 11s, 13s, 15s, 15s, 15s (cap 15s)
-  const retryDelay = (attempt: number) => Math.min(3000 + (attempt - 1) * 2000, 15000);
-
   let lastErr: any;
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const result = await model.generateContent(question.trim());
-      const answer = result.response.text();
-      recordRequest(userId);
-      res.json({ answer, questionsRemaining: DAILY_LIMIT - (todayCount + 1) });
-      return;
-    } catch (err: any) {
-      lastErr = err;
-      const is503 = err?.message?.includes('503') || err?.message?.includes('Service Unavailable');
-      if (is503 && attempt < MAX_RETRIES) {
-        await sleep(retryDelay(attempt));
-        continue;
+  for (const modelName of FALLBACK_MODELS) {
+    const model = genAI.getGenerativeModel({ model: modelName, systemInstruction });
+
+    // Até 6 tentativas por modelo para erros transitórios (503, 429/min)
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        const result = await model.generateContent(question.trim());
+        const answer = result.response.text();
+        recordRequest(userId);
+        console.log(`Respondido com ${modelName}`);
+        res.json({ answer, questionsRemaining: DAILY_LIMIT - (todayCount + 1) });
+        return;
+      } catch (err: any) {
+        lastErr = err;
+
+        if (isDailyQuotaExceeded(err)) {
+          console.warn(`${modelName}: quota diária esgotada, tentando próximo modelo`);
+          break; // sai do loop de tentativas, tenta o próximo modelo
+        }
+
+        if (isTransient(err) && attempt < 6) {
+          const delay = Math.min(3000 + (attempt - 1) * 2000, 12000);
+          await sleep(delay);
+          continue;
+        }
+
+        break; // erro não recuperável neste modelo
       }
-      break;
     }
   }
 
-  console.error('Gemini error:', lastErr?.message ?? lastErr);
-  res.status(500).json({ error: 'Serviço temporariamente indisponível. Tente novamente em instantes.' });
+  console.error('Todos os modelos falharam:', lastErr?.message ?? lastErr);
+  res.status(500).json({ error: 'Serviço de IA temporariamente indisponível. Tente novamente em instantes.' });
 });
 
 export default router;
