@@ -1,14 +1,42 @@
+/**
+ * backend/src/routes/ai.ts — Rota de IA com streaming SSE e histórico de conversa
+ *
+ * POST /api/ai/chat
+ *
+ * Body:
+ *   messages:       Array<{ role: 'user' | 'assistant', text: string }>
+ *                   Histórico completo da conversa, incluindo a pergunta atual como
+ *                   último item (role: 'user'). Máximo recomendado: 12 mensagens.
+ *   userId:         string  — ID do dispositivo para controle de limite diário
+ *   scheduleContext?: string — Contexto compacto da escala do usuário
+ *
+ * Resposta: SSE (text/event-stream)
+ *   Chunks de texto:   data: {"text":"parte da resposta"}\n\n
+ *   Erro durante stream: data: {"error":"mensagem"}\n\n
+ *   Fim:               data: [DONE]\n\n
+ *
+ *   Erros ANTES do stream (rate limit, validação) retornam JSON normal com status 4xx/5xx.
+ *
+ * Modelos com fallback automático quando quota diária esgota:
+ *   gemini-2.5-flash → gemini-2.0-flash → gemini-1.5-flash
+ *
+ * Importante para Render (Nginx):
+ *   Header X-Accel-Buffering: no desativa o buffer do Nginx,
+ *   garantindo que os chunks chegam ao cliente imediatamente.
+ */
+
 import { Router, Request, Response } from 'express';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import type { GenerateContentStreamResult, Content } from '@google/generative-ai';
 import { countTodayRequests, getLastRequestTime, recordRequest } from '../db/database';
 
 const router = Router();
 
-const DAILY_LIMIT = 10;
+const DAILY_LIMIT    = 10;
 const COOLDOWN_SECONDS = 30;
 
-// Modelos em ordem de preferência. Quando um esgota quota diária, cai no próximo.
-// gemini-2.5-flash: 20 RPD | gemini-2.0-flash: 200 RPD | gemini-1.5-flash: 1500 RPD
+// Modelos em ordem de preferência — fallback automático quando quota diária esgota
+// gemini-2.5-flash: 20 RPD  |  gemini-2.0-flash: 200 RPD  |  gemini-1.5-flash: 1500 RPD
 const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
 
 const SYSTEM_CONTEXT = `Você é um assistente especializado em escala de plantões 3x3 rotativa para trabalhadores do Brasil.
@@ -30,7 +58,8 @@ Regras importantes:
 - Substituição: um faz o plantão pelo outro, cria débito pendente
 
 Quando receber a escala do usuário, use-a para responder perguntas sobre datas específicas diretamente, sem pedir informações adicionais.
-Responda de forma clara e objetiva em português. Se a pergunta não for sobre escala de trabalho, redirecione gentilmente.`;
+Responda de forma clara e objetiva em português. Mantenha as respostas concisas.
+Se a pergunta não for sobre escala de trabalho, redirecione gentilmente.`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -50,17 +79,29 @@ function isTransient(err: any): boolean {
     (msg.includes('429') && msg.includes('PerMinute'));
 }
 
+// ─── Rota principal ───────────────────────────────────────────────────────────
+
 router.post('/', async (req: Request, res: Response) => {
-  const { question, userId, scheduleContext } = req.body as {
-    question?: string;
+  const { messages, userId, scheduleContext } = req.body as {
+    messages?: Array<{ role: 'user' | 'assistant'; text: string }>;
     userId?: string;
     scheduleContext?: string;
   };
 
-  if (!question?.trim() || !userId?.trim()) {
-    res.status(400).json({ error: 'question e userId são obrigatórios.' });
+  // ── Validação ──────────────────────────────────────────────────────────────
+
+  if (!Array.isArray(messages) || messages.length === 0 || !userId?.trim()) {
+    res.status(400).json({ error: 'messages (array) e userId são obrigatórios.' });
     return;
   }
+
+  const lastMsg = messages[messages.length - 1];
+  if (lastMsg.role !== 'user' || !lastMsg.text.trim()) {
+    res.status(400).json({ error: 'A última mensagem deve ser do usuário e não pode ser vazia.' });
+    return;
+  }
+
+  // ── Rate limiting ──────────────────────────────────────────────────────────
 
   const todayCount = countTodayRequests(userId);
   if (todayCount >= DAILY_LIMIT) {
@@ -91,46 +132,98 @@ router.post('/', async (req: Request, res: Response) => {
     return;
   }
 
+  // ── Montar contexto e histórico no formato do Gemini ──────────────────────
+
   const systemInstruction = scheduleContext
     ? `${SYSTEM_CONTEXT}\n\n--- ESCALA DO USUÁRIO ---\n${scheduleContext}\n--- FIM DA ESCALA ---`
     : SYSTEM_CONTEXT;
 
+  // Gemini usa 'model' para o papel do assistente, não 'assistant'
+  const contents: Content[] = messages.map((msg) => ({
+    role: (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model',
+    parts: [{ text: msg.text }],
+  }));
+
+  // ── Tentar obter stream do melhor modelo disponível ───────────────────────
+
   const genAI = new GoogleGenerativeAI(apiKey);
+  let streamResult: GenerateContentStreamResult | null = null;
+  let successModel = '';
   let lastErr: any;
 
   for (const modelName of FALLBACK_MODELS) {
     const model = genAI.getGenerativeModel({ model: modelName, systemInstruction });
 
-    // Até 6 tentativas por modelo para erros transitórios (503, 429/min)
     for (let attempt = 1; attempt <= 6; attempt++) {
       try {
-        const result = await model.generateContent(question.trim());
-        const answer = result.response.text();
-        recordRequest(userId);
-        console.log(`Respondido com ${modelName}`);
-        res.json({ answer, questionsRemaining: DAILY_LIMIT - (todayCount + 1) });
-        return;
+        // generateContentStream rejeita a Promise para erros de quota/auth.
+        // Uma vez resolvida, o stream de chunks fica disponível em .stream
+        const r = await model.generateContentStream({ contents });
+        streamResult  = r;
+        successModel  = modelName;
+        break;
       } catch (err: any) {
         lastErr = err;
 
         if (isDailyQuotaExceeded(err)) {
           console.warn(`${modelName}: quota diária esgotada, tentando próximo modelo`);
-          break; // sai do loop de tentativas, tenta o próximo modelo
+          break; // Próximo modelo
         }
 
         if (isTransient(err) && attempt < 6) {
+          // Backoff exponencial para erros transitórios (503, 429/min)
           const delay = Math.min(3000 + (attempt - 1) * 2000, 12000);
           await sleep(delay);
           continue;
         }
 
-        break; // erro não recuperável neste modelo
+        break; // Erro não recuperável neste modelo
       }
     }
+
+    if (streamResult) break;
   }
 
-  console.error('Todos os modelos falharam:', lastErr?.message ?? lastErr);
-  res.status(500).json({ error: 'Serviço de IA temporariamente indisponível. Tente novamente em instantes.' });
+  // Todos os modelos falharam — retorna JSON normal (headers ainda não enviados)
+  if (!streamResult) {
+    console.error('Todos os modelos falharam:', lastErr?.message ?? lastErr);
+    res.status(500).json({ error: 'Serviço de IA temporariamente indisponível. Tente novamente em instantes.' });
+    return;
+  }
+
+  // ── Iniciar resposta SSE ───────────────────────────────────────────────────
+
+  // Registra a pergunta ANTES de começar o streaming (Gemini já foi chamado)
+  recordRequest(userId);
+  console.log(`Streaming iniciado com ${successModel} para userId=${userId}`);
+
+  // Headers SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  // X-Accel-Buffering: no → desativa buffer do Nginx no Render,
+  // garantindo que cada chunk é enviado ao cliente imediatamente
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // ── Transmitir chunks ──────────────────────────────────────────────────────
+
+  try {
+    for await (const chunk of streamResult.stream) {
+      const text = chunk.text();
+      if (text) {
+        // Formato SSE: cada evento é "data: <json>\n\n"
+        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+      }
+    }
+  } catch (err: any) {
+    // Erro durante o streaming (raro) — envia evento de erro antes de fechar
+    console.error(`Erro durante streaming (${successModel}):`, err?.message ?? err);
+    res.write(`data: ${JSON.stringify({ error: 'Resposta interrompida inesperadamente. Tente novamente.' })}\n\n`);
+  }
+
+  // Sinaliza fim do stream
+  res.write('data: [DONE]\n\n');
+  res.end();
 });
 
 export default router;
