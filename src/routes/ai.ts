@@ -95,9 +95,32 @@ router.post('/', async (req: Request, res: Response) => {
     return;
   }
 
+  // Bloqueia userIds suspeitos (muito longos ou com caracteres inválidos)
+  if (!/^[\w\-]{4,64}$/.test(userId)) {
+    res.status(400).json({ error: 'userId inválido.' });
+    return;
+  }
+
+  // Limita o histórico para evitar payloads gigantes consumindo tokens
+  if (messages.length > 20) {
+    res.status(400).json({ error: 'Histórico de mensagens muito longo.' });
+    return;
+  }
+
   const lastMsg = messages[messages.length - 1];
   if (lastMsg.role !== 'user' || !lastMsg.text.trim()) {
     res.status(400).json({ error: 'A última mensagem deve ser do usuário e não pode ser vazia.' });
+    return;
+  }
+
+  // Valida tamanho máximo de cada mensagem e do scheduleContext
+  if (messages.some(m => typeof m.text !== 'string' || m.text.length > 4000)) {
+    res.status(400).json({ error: 'Mensagem individual muito longa (máx 4000 caracteres).' });
+    return;
+  }
+
+  if (scheduleContext !== undefined && (typeof scheduleContext !== 'string' || scheduleContext.length > 2000)) {
+    res.status(400).json({ error: 'scheduleContext inválido ou muito longo.' });
     return;
   }
 
